@@ -17,7 +17,7 @@ class License(Base):
     __tablename__ = "licenses"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    cedula: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
+    cedula: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     nombre: Mapped[str] = mapped_column(String(150), nullable=False)
     cargo: Mapped[str] = mapped_column(String(100), nullable=True)
     proyecto: Mapped[str] = mapped_column(String(150), nullable=True)

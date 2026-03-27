@@ -12,7 +12,7 @@ from app.schemas.enterprise import (
 )
 from app.services.audit_service import log_action
 
-router = APIRouter(prefix="/enterprises", tags=["enterprises"])
+router = APIRouter(tags=["enterprises"])
 
 
 @router.get("/", response_model=list[EnterpriseResponse])
@@ -35,7 +35,8 @@ def list_enterprises(
     if is_active is not None:
         query = query.where(Enterprise.is_active == is_active)
     
-    query = query.offset(skip).limit(limit)
+    # MSSQL requiere ORDER BY cuando se usa OFFSET/LIMIT
+    query = query.order_by(Enterprise.id).offset(skip).limit(limit)
     enterprises = db.scalars(query).all()
     return enterprises
 

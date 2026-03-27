@@ -1,14 +1,18 @@
 from datetime import date
 from io import BytesIO
+import unicodedata
+import logging
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
+from app.models.enterprise import Enterprise
 from app.models.license import License, LicenseStatusEnum
 from app.models.software import Software
 from app.models.user import User
@@ -17,6 +21,119 @@ from app.services.audit_service import log_action
 from app.utils.license_status import calculate_status
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+REQUIRED_IMPORT_COLUMNS = {"CEDULA", "NOMBRE"}
+ACTIVE_LICENSE_STATUSES = {LicenseStatusEnum.active, LicenseStatusEnum.expiring}
+
+
+def _normalize_header(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).replace("\xa0", " ").strip()
+    text = " ".join(text.split())
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.upper()
+
+
+def _normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    normalized.columns = [_normalize_header(col) for col in normalized.columns]
+    return normalized
+
+
+def _read_excel_with_detected_header(file: UploadFile) -> pd.DataFrame:
+    file.file.seek(0)
+    df = pd.read_excel(file.file)
+    df = _normalize_dataframe_columns(df)
+
+    if REQUIRED_IMPORT_COLUMNS.issubset(set(df.columns)):
+        return df
+
+    file.file.seek(0)
+    raw = pd.read_excel(file.file, header=None)
+    max_rows_to_scan = min(15, len(raw.index))
+    header_row = None
+
+    for idx in range(max_rows_to_scan):
+        normalized_row = {_normalize_header(v) for v in raw.iloc[idx].tolist()}
+        if REQUIRED_IMPORT_COLUMNS.issubset(normalized_row):
+            header_row = idx
+            break
+
+    if header_row is None:
+        detected = [str(col) for col in df.columns if str(col)]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Columnas requeridas faltantes: CEDULA, NOMBRE. "
+                f"Encabezados detectados: {', '.join(detected) if detected else 'ninguno'}"
+            ),
+        )
+
+    headers = raw.iloc[header_row].tolist()
+    data = raw.iloc[header_row + 1 :].copy()
+    data.columns = headers
+    data = _normalize_dataframe_columns(data)
+    return data
+
+
+def _is_empty(value) -> bool:
+    return value is None or pd.isna(value) or str(value).strip() == ""
+
+
+def _to_clean_str(value) -> str | None:
+    if _is_empty(value):
+        return None
+    return str(value).strip()
+
+
+def _to_cedula(value) -> str:
+    if _is_empty(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _to_int_or_default(value, default: int) -> int:
+    if _is_empty(value):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        return int(float(text))
+
+
+def _to_bool(value, default: bool = False) -> bool:
+    if _is_empty(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+
+    text = str(value).strip().lower()
+    true_values = {"1", "true", "si", "sí", "yes", "y"}
+    false_values = {"0", "false", "no", "n"}
+
+    if text in true_values:
+        return True
+    if text in false_values:
+        return False
+    raise ValueError(f"Valor booleano invalido: {value}")
+
+
+def _to_date(value):
+    if _is_empty(value):
+        return None
+    return pd.to_datetime(value).date()
 
 
 def _serialize(license_item: License) -> LicenseRead:
@@ -84,13 +201,25 @@ def create_license(
     if not software:
         raise HTTPException(status_code=400, detail="Software invalido")
 
-    existing = db.scalar(select(License).where(License.cedula == payload.cedula))
-    if existing:
-        raise HTTPException(status_code=400, detail="Cedula ya registrada")
+    new_status = calculate_status(payload.vencimiento_licencia_fecha)
+    if new_status in ACTIVE_LICENSE_STATUSES:
+        existing_active = db.scalar(
+            select(License.id).where(
+                License.cedula == payload.cedula,
+                License.software_id == payload.software_id,
+                License.enterprise_id == 1,
+                License.status.in_(ACTIVE_LICENSE_STATUSES),
+            )
+        )
+        if existing_active:
+            raise HTTPException(
+                status_code=400,
+                detail="El usuario ya tiene una licencia activa para este software",
+            )
 
     item = License(
         **payload.model_dump(),
-        status=calculate_status(payload.vencimiento_licencia_fecha),
+        status=new_status,
     )
     db.add(item)
     db.commit()
@@ -146,49 +275,88 @@ def import_licenses(
     if not file.filename.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Solo se admite .xlsx")
 
-    df = pd.read_excel(file.file)
+    df = _read_excel_with_detected_header(file)
+
     created = 0
     errors = []
+    existing_active_keys = set(
+        db.execute(
+            select(License.cedula, License.software_id, License.enterprise_id).where(
+                License.status.in_(ACTIVE_LICENSE_STATUSES)
+            )
+        ).all()
+    )
+    batch_active_keys = set()
 
     for idx, row in df.iterrows():
         try:
-            cedula = str(row.get("CEDULA", "")).strip()
-            nombre = str(row.get("NOMBRE", "")).strip()
-            software_id = int(row.get("software_id", 1))
-            enterprise_id = int(row.get("enterprise_id", 1))
+            cedula = _to_cedula(row.get("CEDULA"))
+            nombre = _to_clean_str(row.get("NOMBRE")) or ""
+            software_id = _to_int_or_default(row.get("SOFTWARE_ID"), 1)
+            enterprise_id = _to_int_or_default(row.get("ENTERPRISE_ID"), 1)
 
             if not cedula or not nombre:
                 errors.append(f"Fila {idx + 2}: Falta cedula o nombre")
                 continue
 
-            existing = db.scalar(select(License).where(License.cedula == cedula))
-            if existing:
-                errors.append(f"Fila {idx + 2}: Cedula {cedula} ya existe")
+            software = db.scalar(select(Software).where(Software.id == software_id))
+            if not software:
+                errors.append(f"Fila {idx + 2}: software_id {software_id} no existe")
+                continue
+
+            enterprise_exists = db.scalar(select(Enterprise.id).where(Enterprise.id == enterprise_id))
+            if not enterprise_exists:
+                errors.append(f"Fila {idx + 2}: enterprise_id {enterprise_id} no existe")
+                continue
+
+            status = calculate_status(_to_date(row.get("FECHA DE VENCIMIENTO LICENCIA")))
+            active_key = (cedula, software_id, enterprise_id)
+            if status in ACTIVE_LICENSE_STATUSES and (
+                active_key in existing_active_keys or active_key in batch_active_keys
+            ):
+                errors.append(
+                    f"Fila {idx + 2}: {nombre} ya tiene una licencia activa para software {software.name}"
+                )
                 continue
 
             item = License(
                 cedula=cedula,
                 nombre=nombre,
-                cargo=str(row.get("CARGO", "")).strip() or None,
-                proyecto=str(row.get("PROYECTO", "")).strip() or None,
+                cargo=_to_clean_str(row.get("CARGO")),
+                proyecto=_to_clean_str(row.get("PROYECTO")),
                 enterprise_id=enterprise_id,
                 software_id=software_id,
-                correos_personales=str(row.get("CORREOS PERSONALES", "")).strip() or None,
-                email_enviado_fecha=pd.to_datetime(row.get("FECHA DE ENVIO DE CORREO")).date() if pd.notna(row.get("FECHA DE ENVIO DE CORREO")) else None,
-                habilitacion_licencia_fecha=pd.to_datetime(row.get("FECHA DE HABILITACION DE LICENCIA")).date() if pd.notna(row.get("FECHA DE HABILITACION DE LICENCIA")) else None,
-                vencimiento_licencia_fecha=pd.to_datetime(row.get("FECHA DE VENCIMIENTO LICENCIA")).date() if pd.notna(row.get("FECHA DE VENCIMIENTO LICENCIA")) else None,
-                verificacion_cedula=bool(row.get("VERIFICACIÓN CEDULA", False)),
-                verificacion_licencia=bool(row.get("VERIFICACIÓN LICENCIA", False)),
-                verificacion_nomina=bool(row.get("VERIFICACION NOMINA", False)),
-                observaciones=str(row.get("OBSERVACIONES", "")).strip() or None,
-                status=calculate_status(pd.to_datetime(row.get("FECHA DE VENCIMIENTO LICENCIA")).date() if pd.notna(row.get("FECHA DE VENCIMIENTO LICENCIA")) else None),
+                correos_personales=_to_clean_str(row.get("CORREOS PERSONALES")),
+                email_enviado_fecha=_to_date(row.get("FECHA DE ENVIO DE CORREO")),
+                habilitacion_licencia_fecha=_to_date(row.get("FECHA DE HABILITACION DE LICENCIA")),
+                vencimiento_licencia_fecha=_to_date(row.get("FECHA DE VENCIMIENTO LICENCIA")),
+                verificacion_cedula=_to_bool(row.get("VERIFICACION CEDULA", False)),
+                verificacion_licencia=_to_bool(row.get("VERIFICACION LICENCIA", False)),
+                verificacion_nomina=_to_bool(row.get("VERIFICACION NOMINA", False)),
+                observaciones=_to_clean_str(row.get("OBSERVACIONES")),
+                status=status,
             )
             db.add(item)
+            if status in ACTIVE_LICENSE_STATUSES:
+                batch_active_keys.add(active_key)
             created += 1
         except Exception as e:
             errors.append(f"Fila {idx + 2}: {str(e)}")
 
-    db.commit()
+    if errors:
+        logger.warning("Importacion de licencias con errores (%s):", len(errors))
+        for err in errors:
+            logger.warning(err)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Conflicto de integridad al importar. Verifica duplicados y restricciones de base de datos.",
+        )
+
     log_action(db, current_user.id, "IMPORT", "licenses", "bulk", f"Importadas {created}, Errores: {len(errors)}")
     return {"created": created, "errors": errors}
 

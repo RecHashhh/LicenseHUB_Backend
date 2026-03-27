@@ -28,7 +28,7 @@ class LicenseRequest(Base):
     )
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     software_id: Mapped[int] = mapped_column(ForeignKey("software.id"), nullable=False)
-    project_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    project_name: Mapped[str] = mapped_column("proyecto", String(120), nullable=False)
     justification: Mapped[str] = mapped_column(Text, nullable=False)
     required_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_method: Mapped[str] = mapped_column(String(80), nullable=True)
